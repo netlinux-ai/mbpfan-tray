@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=mbpfan Fan Manager
+Comment=Systray indicator for MacBook fan speed control via mbpfan
+Exec=/usr/local/bin/mbpfan-tray
+Icon=sensors-fan-symbolic
+Terminal=false
+X-XFCE-Autostart=true

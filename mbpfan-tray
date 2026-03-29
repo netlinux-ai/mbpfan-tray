@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""
+mbpfan Tray Manager -- systray indicator for MacBook fan control.
+
+Reads fan speed and CPU temperature from sysfs/applesmc and provides
+a GUI to adjust mbpfan settings. Changes are written to /etc/mbpfan.conf
+via pkexec and the daemon is restarted.
+"""
+
+import os
+import re
+import subprocess
+import glob
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import Gtk, GLib, AyatanaAppIndicator3
+
+# -- sysfs paths -------------------------------------------------------------
+APPLESMC_FAN = "/sys/devices/platform/applesmc.768"
+CORETEMP = "/sys/devices/platform/coretemp.0/hwmon"
+MBPFAN_CONF = "/etc/mbpfan.conf"
+
+# -- defaults matching mbpfan ------------------------------------------------
+DEFAULTS = {
+    "min_fan1_speed": 2000,
+    "max_fan1_speed": 6200,
+    "low_temp": 63,
+    "high_temp": 66,
+    "max_temp": 86,
+    "polling_interval": 1,
+}
+
+
+# -- helpers ------------------------------------------------------------------
+def read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def find_fans():
+    """Return list of (label, speed_path, min_path, max_path) for each fan."""
+    fans = []
+    for i in range(1, 11):
+        speed = os.path.join(APPLESMC_FAN, f"fan{i}_input")
+        if os.path.exists(speed):
+            label_path = os.path.join(APPLESMC_FAN, f"fan{i}_label")
+            try:
+                with open(label_path) as f:
+                    label = f.read().strip()
+            except OSError:
+                label = f"Fan {i}"
+            min_path = os.path.join(APPLESMC_FAN, f"fan{i}_min")
+            max_path = os.path.join(APPLESMC_FAN, f"fan{i}_max")
+            fans.append((label, speed, min_path, max_path))
+    return fans
+
+
+def get_max_cpu_temp():
+    """Return highest CPU core temperature in degrees C."""
+    hwmon = glob.glob(os.path.join(CORETEMP, "hwmon*"))
+    if not hwmon:
+        return 0
+    temps = []
+    for p in glob.glob(os.path.join(hwmon[0], "temp*_input")):
+        temps.append(read_int(p) // 1000)
+    return max(temps) if temps else 0
+
+
+def get_fan_speeds():
+    """Return list of (label, current_rpm) for each fan."""
+    result = []
+    for label, speed_path, _, _ in find_fans():
+        rpm = read_int(speed_path)
+        result.append((label, rpm))
+    return result
+
+
+def get_fan_rpm():
+    """Return the first fan's RPM for icon display."""
+    fans = find_fans()
+    if fans:
+        return read_int(fans[0][1])
+    return 0
+
+
+def load_mbpfan_conf():
+    """Parse /etc/mbpfan.conf and return dict of settings."""
+    settings = dict(DEFAULTS)
+    try:
+        with open(MBPFAN_CONF) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                m = re.match(r"(\w+)\s*=\s*(\d+)", line)
+                if m:
+                    settings[m.group(1)] = int(m.group(2))
+    except OSError:
+        pass
+    return settings
+
+
+def write_mbpfan_conf(settings):
+    """Write settings to /etc/mbpfan.conf via pkexec. Returns True on success."""
+    lines = ["[general]"]
+    for key in ("min_fan1_speed", "max_fan1_speed", "low_temp",
+                "high_temp", "max_temp", "polling_interval"):
+        if key in settings:
+            lines.append(f"{key} = {settings[key]}")
+    conf = "\n".join(lines) + "\n"
+    r = subprocess.run(
+        ["pkexec", "bash", "-c", f"cat > {MBPFAN_CONF} << 'MBPFAN_EOF'\n{conf}MBPFAN_EOF"],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
+def restart_mbpfan():
+    """Restart mbpfan daemon via pkexec. Returns True on success."""
+    r = subprocess.run(
+        ["pkexec", "systemctl", "restart", "mbpfan"],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
+def fan_icon(rpm, max_rpm=6200):
+    """Choose an icon based on fan speed."""
+    if rpm == 0:
+        return "sensors-fan-symbolic"
+    ratio = rpm / max_rpm
+    if ratio < 0.3:
+        return "sensors-fan-symbolic"
+    elif ratio < 0.6:
+        return "sensors-fan-symbolic"
+    else:
+        return "dialog-warning-symbolic"
+
+
+def notify(summary, body="", urgency="normal"):
+    subprocess.Popen(
+        ["notify-send", f"--urgency={urgency}", summary, body],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+# -- Settings dialog ----------------------------------------------------------
+class SettingsDialog(Gtk.Window):
+    def __init__(self, app):
+        super().__init__(title="mbpfan Fan Manager", resizable=False)
+        self.app = app
+        self.set_border_width(12)
+        self.set_default_size(400, -1)
+        self.connect("delete-event", self._on_close)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.add(vbox)
+
+        # -- status -----------------------------------------------------------
+        frame_s = Gtk.Frame(label="Current Status")
+        grid_s = Gtk.Grid(column_spacing=12, row_spacing=4, margin=8)
+        frame_s.add(grid_s)
+        vbox.pack_start(frame_s, False, False, 0)
+
+        self.lbl_temp = Gtk.Label(xalign=1)
+        self.lbl_fans = []
+        labels = [("CPU Temp:", self.lbl_temp)]
+
+        fans = find_fans()
+        for i, (fan_label, _, _, _) in enumerate(fans):
+            lbl = Gtk.Label(xalign=1)
+            self.lbl_fans.append(lbl)
+            labels.append((f"{fan_label}:", lbl))
+
+        for i, (label, widget) in enumerate(labels):
+            l = Gtk.Label(xalign=0)
+            l.set_markup(f"<b>{label}</b>")
+            grid_s.attach(l, 0, i, 1, 1)
+            widget.set_hexpand(True)
+            grid_s.attach(widget, 1, i, 1, 1)
+
+        # -- temperature thresholds -------------------------------------------
+        frame_t = Gtk.Frame(label="Temperature Thresholds")
+        grid_t = Gtk.Grid(column_spacing=8, row_spacing=6, margin=8)
+        frame_t.add(grid_t)
+        vbox.pack_start(frame_t, False, False, 0)
+
+        settings = load_mbpfan_conf()
+
+        self.adj_low = Gtk.Adjustment(
+            value=settings["low_temp"], lower=30, upper=90,
+            step_increment=1, page_increment=5,
+        )
+        self.adj_high = Gtk.Adjustment(
+            value=settings["high_temp"], lower=30, upper=95,
+            step_increment=1, page_increment=5,
+        )
+        self.adj_max = Gtk.Adjustment(
+            value=settings["max_temp"], lower=50, upper=105,
+            step_increment=1, page_increment=5,
+        )
+
+        for row, (label, adj) in enumerate([
+            ("Low temp (fans at min):", self.adj_low),
+            ("High temp (fans ramp up):", self.adj_high),
+            ("Max temp (fans at max):", self.adj_max),
+        ]):
+            l = Gtk.Label(xalign=0)
+            l.set_markup(f"<b>{label}</b>")
+            grid_t.attach(l, 0, row, 1, 1)
+            spin = Gtk.SpinButton(adjustment=adj, digits=0)
+            grid_t.attach(spin, 1, row, 1, 1)
+            grid_t.attach(Gtk.Label(label="C"), 2, row, 1, 1)
+
+        # -- fan speed limits -------------------------------------------------
+        frame_f = Gtk.Frame(label="Fan Speed Limits")
+        grid_f = Gtk.Grid(column_spacing=8, row_spacing=6, margin=8)
+        frame_f.add(grid_f)
+        vbox.pack_start(frame_f, False, False, 0)
+
+        self.adj_min_fan = Gtk.Adjustment(
+            value=settings["min_fan1_speed"], lower=1000, upper=6200,
+            step_increment=100, page_increment=500,
+        )
+        self.adj_max_fan = Gtk.Adjustment(
+            value=settings["max_fan1_speed"], lower=1000, upper=6200,
+            step_increment=100, page_increment=500,
+        )
+
+        for row, (label, adj) in enumerate([
+            ("Minimum RPM:", self.adj_min_fan),
+            ("Maximum RPM:", self.adj_max_fan),
+        ]):
+            l = Gtk.Label(xalign=0)
+            l.set_markup(f"<b>{label}</b>")
+            grid_f.attach(l, 0, row, 1, 1)
+            spin = Gtk.SpinButton(adjustment=adj, digits=0)
+            grid_f.attach(spin, 1, row, 1, 1)
+            grid_f.attach(Gtk.Label(label="RPM"), 2, row, 1, 1)
+
+        # -- polling interval -------------------------------------------------
+        frame_p = Gtk.Frame(label="Polling")
+        grid_p = Gtk.Grid(column_spacing=8, row_spacing=6, margin=8)
+        frame_p.add(grid_p)
+        vbox.pack_start(frame_p, False, False, 0)
+
+        self.adj_poll = Gtk.Adjustment(
+            value=settings["polling_interval"], lower=1, upper=10,
+            step_increment=1, page_increment=1,
+        )
+        l = Gtk.Label(xalign=0)
+        l.set_markup("<b>Poll interval:</b>")
+        grid_p.attach(l, 0, 0, 1, 1)
+        spin = Gtk.SpinButton(adjustment=self.adj_poll, digits=0)
+        grid_p.attach(spin, 1, 0, 1, 1)
+        grid_p.attach(Gtk.Label(label="sec"), 2, 0, 1, 1)
+
+        # -- buttons ----------------------------------------------------------
+        btn_box = Gtk.Box(spacing=8)
+        btn_box.set_halign(Gtk.Align.END)
+        vbox.pack_start(btn_box, False, False, 0)
+
+        btn_apply = Gtk.Button(label="Apply")
+        btn_apply.connect("clicked", self._on_apply)
+        btn_box.pack_start(btn_apply, False, False, 0)
+
+        btn_close = Gtk.Button(label="Close")
+        btn_close.connect("clicked", lambda _: self._on_close(None, None))
+        btn_box.pack_start(btn_close, False, False, 0)
+
+        self._update_status()
+        self._timer = GLib.timeout_add_seconds(2, self._update_status)
+        self.show_all()
+
+    def _update_status(self):
+        try:
+            temp = get_max_cpu_temp()
+            self.lbl_temp.set_text(f"{temp} C")
+            fan_speeds = get_fan_speeds()
+            for i, (label, rpm) in enumerate(fan_speeds):
+                if i < len(self.lbl_fans):
+                    self.lbl_fans[i].set_text(f"{rpm} RPM")
+        except Exception:
+            pass
+        return True
+
+    def _on_apply(self, _btn):
+        low = int(self.adj_low.get_value())
+        high = int(self.adj_high.get_value())
+        max_t = int(self.adj_max.get_value())
+
+        if not (low < high < max_t):
+            dialog = Gtk.MessageDialog(
+                transient_for=self,
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.OK,
+                text="Invalid thresholds",
+            )
+            dialog.format_secondary_text(
+                "Temperatures must satisfy: low < high < max"
+            )
+            dialog.run()
+            dialog.destroy()
+            return
+
+        settings = {
+            "min_fan1_speed": int(self.adj_min_fan.get_value()),
+            "max_fan1_speed": int(self.adj_max_fan.get_value()),
+            "low_temp": low,
+            "high_temp": high,
+            "max_temp": max_t,
+            "polling_interval": int(self.adj_poll.get_value()),
+        }
+
+        ok = write_mbpfan_conf(settings)
+        if ok:
+            restart_mbpfan()
+            notify("mbpfan", "Fan settings applied and daemon restarted.")
+            self._update_status()
+        else:
+            notify("mbpfan", "Failed to apply settings.", "critical")
+
+    def _on_close(self, _w, _ev):
+        GLib.source_remove(self._timer)
+        self.destroy()
+        self.app.settings_win = None
+        return True
+
+
+# -- Tray application ---------------------------------------------------------
+class MbpfanTray:
+    TEMP_WARN = 85
+    TEMP_CRIT = 95
+
+    def __init__(self):
+        self.settings_win = None
+        self._prev_temp = 0
+        self._notified_warn = False
+        self._notified_crit = False
+
+        self.indicator = AyatanaAppIndicator3.Indicator.new(
+            "mbpfan-tray",
+            "sensors-fan-symbolic",
+            AyatanaAppIndicator3.IndicatorCategory.HARDWARE,
+        )
+        self.indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
+
+        self._build_menu()
+        self._update()
+        GLib.timeout_add_seconds(3, self._update)
+
+    def _build_menu(self):
+        menu = Gtk.Menu()
+
+        self.mi_temp = Gtk.MenuItem(label="--")
+        self.mi_temp.set_sensitive(False)
+        menu.append(self.mi_temp)
+
+        self.mi_fans = []
+        for _ in range(len(find_fans()) or 1):
+            mi = Gtk.MenuItem(label="--")
+            mi.set_sensitive(False)
+            menu.append(mi)
+            self.mi_fans.append(mi)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        mi_settings = Gtk.MenuItem(label="Settings...")
+        mi_settings.connect("activate", self._on_settings)
+        menu.append(mi_settings)
+
+        mi_quit = Gtk.MenuItem(label="Quit")
+        mi_quit.connect("activate", lambda _: Gtk.main_quit())
+        menu.append(mi_quit)
+
+        menu.show_all()
+        self.indicator.set_menu(menu)
+
+    def _update(self):
+        try:
+            temp = get_max_cpu_temp()
+            fan_speeds = get_fan_speeds()
+        except Exception:
+            return True
+
+        rpm = fan_speeds[0][1] if fan_speeds else 0
+        conf = load_mbpfan_conf()
+        max_rpm = conf.get("max_fan1_speed", 6200)
+
+        self.indicator.set_icon_full(fan_icon(rpm, max_rpm), f"{temp} C")
+        self.indicator.set_label(f" {temp} C", "")
+
+        self.mi_temp.set_label(f"CPU: {temp} C")
+        for i, (label, speed) in enumerate(fan_speeds):
+            if i < len(self.mi_fans):
+                self.mi_fans[i].set_label(f"{label}: {speed} RPM")
+
+        self._check_notifications(temp)
+        self._prev_temp = temp
+        return True
+
+    def _check_notifications(self, temp):
+        if temp >= self.TEMP_CRIT and not self._notified_crit:
+            self._notified_crit = True
+            notify("CPU Temperature Critical",
+                   f"CPU at {temp} C!", "critical")
+        elif temp >= self.TEMP_WARN and not self._notified_warn:
+            self._notified_warn = True
+            notify("CPU Temperature Warning",
+                   f"CPU at {temp} C.", "normal")
+
+        if temp < self.TEMP_WARN - 5:
+            self._notified_warn = False
+            self._notified_crit = False
+
+    def _on_settings(self, _mi):
+        if self.settings_win is not None:
+            self.settings_win.present()
+            return
+        self.settings_win = SettingsDialog(self)
+
+    def run(self):
+        Gtk.main()
+
+
+if __name__ == "__main__":
+    MbpfanTray().run()
