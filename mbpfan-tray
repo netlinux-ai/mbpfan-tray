@@ -129,17 +129,16 @@ def restart_mbpfan():
     return r.returncode == 0
 
 
-def fan_icon(rpm, max_rpm=6200):
-    """Choose an icon based on fan speed."""
-    if rpm == 0:
-        return "sensors-fan-symbolic"
-    ratio = rpm / max_rpm
-    if ratio < 0.3:
-        return "sensors-fan-symbolic"
-    elif ratio < 0.6:
-        return "sensors-fan-symbolic"
+def temp_icon(temp):
+    """Choose an icon based on CPU temperature."""
+    if temp < 50:
+        return "weather-clear-symbolic"
+    elif temp < 70:
+        return "weather-few-clouds-symbolic"
+    elif temp < 85:
+        return "weather-overcast-symbolic"
     else:
-        return "dialog-warning-symbolic"
+        return "weather-severe-alert-symbolic"
 
 
 def notify(summary, body="", urgency="normal"):
@@ -345,7 +344,7 @@ class MbpfanTray:
 
         self.indicator = AyatanaAppIndicator3.Indicator.new(
             "mbpfan-tray",
-            "sensors-fan-symbolic",
+            "weather-clear-symbolic",
             AyatanaAppIndicator3.IndicatorCategory.HARDWARE,
         )
         self.indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
@@ -388,11 +387,7 @@ class MbpfanTray:
         except Exception:
             return True
 
-        rpm = fan_speeds[0][1] if fan_speeds else 0
-        conf = load_mbpfan_conf()
-        max_rpm = conf.get("max_fan1_speed", 6200)
-
-        self.indicator.set_icon_full(fan_icon(rpm, max_rpm), f"{temp} C")
+        self.indicator.set_icon_full(temp_icon(temp), f"{temp} C")
         self.indicator.set_label(f" {temp} C", "")
 
         self.mi_temp.set_label(f"CPU: {temp} C")
